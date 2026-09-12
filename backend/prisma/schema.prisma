@@ -1,0 +1,180 @@
+// Velozity Global Solutions — Client Project Dashboard
+// Prisma schema: PostgreSQL, relational, indexed on frequently queried columns.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  PM
+  DEVELOPER
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  DONE
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_MOVED_TO_REVIEW
+  TASK_OVERDUE
+}
+
+model User {
+  id            String   @id @default(uuid())
+  name          String
+  email         String   @unique
+  passwordHash  String
+  role          Role
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // A PM "manages" projects they created
+  projectsManaged   Project[]        @relation("ProjectManager")
+  // A Developer is assigned tasks
+  tasksAssigned     Task[]           @relation("TaskAssignee")
+  statusChangesMade TaskStatusEvent[] @relation("StatusChangedBy")
+  activityEvents    ActivityEvent[]  @relation("ActivityActor")
+  notifications     Notification[]   @relation("NotificationRecipient")
+  refreshTokens     RefreshToken[]
+
+  @@index([role])
+}
+
+// Refresh tokens are persisted (hashed) so they can be revoked server-side.
+model RefreshToken {
+  id        String   @id @default(uuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Client {
+  id        String    @id @default(uuid())
+  name      String
+  email     String?
+  createdAt DateTime  @default(now())
+  projects  Project[]
+}
+
+model Project {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  clientId    String
+  client      Client   @relation(fields: [clientId], references: [id])
+  managerId   String
+  manager     User     @relation("ProjectManager", fields: [managerId], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tasks           Task[]
+  activityEvents  ActivityEvent[]
+
+  // PMs frequently query "my projects"; used for ownership checks on every request.
+  @@index([managerId])
+  @@index([clientId])
+}
+
+model Task {
+  id           String       @id @default(uuid())
+  title        String
+  description  String?
+  projectId    String
+  project      Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  assigneeId   String?
+  assignee     User?        @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  status       TaskStatus   @default(TODO)
+  priority     TaskPriority @default(MEDIUM)
+  dueDate      DateTime?
+  isOverdue    Boolean      @default(false)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  statusEvents   TaskStatusEvent[]
+  activityEvents ActivityEvent[]
+  notifications  Notification[]
+
+  // Filtering by status/priority/due date and assignee ("my tasks") are the
+  // hottest read paths (dashboards + filter bar), so each gets its own index.
+  // A composite covers the Developer dashboard sort (priority then due date).
+  @@index([projectId])
+  @@index([assigneeId])
+  @@index([status])
+  @@index([priority])
+  @@index([dueDate])
+  @@index([assigneeId, priority, dueDate])
+}
+
+// Durable, queryable log of every status transition. Source of truth for the
+// activity feed's "missed events" catch-up — never derived/computed on the fly.
+model TaskStatusEvent {
+  id          String     @id @default(uuid())
+  taskId      String
+  task        Task       @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  fromStatus  TaskStatus?
+  toStatus    TaskStatus
+  changedById String
+  changedBy   User       @relation("StatusChangedBy", fields: [changedById], references: [id])
+  createdAt   DateTime   @default(now())
+
+  @@index([taskId])
+  @@index([createdAt])
+}
+
+// Denormalized, role-scoped feed row. One row per user-facing event so the
+// feed query is a single indexed scan instead of a join-heavy reconstruction.
+model ActivityEvent {
+  id         String   @id @default(uuid())
+  projectId  String
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  taskId     String?
+  task       Task?    @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  actorId    String
+  actor      User     @relation("ActivityActor", fields: [actorId], references: [id])
+  message    String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  // Feed reads are always "latest N for project/user scope" -> composite
+  // index keeps createdAt DESC pagination fast per project.
+  @@index([projectId, createdAt])
+  @@index([actorId, createdAt])
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  user      User             @relation("NotificationRecipient", fields: [userId], references: [id], onDelete: Cascade)
+  taskId    String?
+  task      Task?            @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  type      NotificationType
+  message   String
+  isRead    Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  // Notification bell always queries "unread for this user, newest first".
+  @@index([userId, isRead])
+  @@index([userId, createdAt])
+}
